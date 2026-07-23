@@ -115,7 +115,7 @@ def como_matriz(t: torch.Tensor) -> torch.Tensor:
 class MuonSR(Optimizer):
     def __init__(self, model, lr: float = 3e-3, momentum: float = 0.95,
                  betas=(0.9, 0.95), eps: float = 1e-8, weight_decay: float = 0.01,
-                 ns_steps: int = 5, rho_rel: float = 0.20,
+                 ns_steps: int = 5, rho_alvo_F: float = 1.68, rho_teto_rel: float = 0.10,
                  fase2_lr_frac: float = 0.1, fase2_rampa: int = 200,
                  fase2_patience: int = 3, fase2_teto_frac: float = 0.25,
                  gatilho_frac: float = 0.15):
@@ -134,24 +134,51 @@ class MuonSR(Optimizer):
         super().__init__(grupos, base)
 
         # ---------------------------------------------------------------------
-        # CALIBRAÇÃO DE ρ
+        # CALIBRAÇÃO DE ρ  —  o hiperparâmetro é a NORMA, não o ρ
         #
         # Uma matriz m×n perturbada com norma espectral ρ tem min(m,n) valores
         # singulares iguais a ρ, logo ‖ε_i‖_F = ρ·√min(m,n). Somando as k
-        # matrizes:   ‖ε‖_F = ρ · √S · NS_EFF,   com  S = Σ_i min(m_i, n_i).
+        # matrizes:
         #
-        # Consequência: um ρ FIXO significa perturbações cada vez maiores
-        # conforme o modelo cresce. Medimos isso: ρ=0,03 dava ‖ε‖_F=1,68 num
-        # modelo de 3M e 3,76 num de 31M — e ‖ε‖_F≈3 já destrói o modelo.
+        #        ‖ε‖_F  =  ρ · √S · NS_EFF ,      S = Σ_i min(m_i, n_i)
         #
-        # A correção: fixar a dose como FRAÇÃO de ‖W‖_F. Assim ela é
-        # adimensional e transfere entre MLP, CNN e Transformer — que é o que o
-        # benchmark exige (um único conjunto de hiperparâmetros).
+        # Consequência: um ρ FIXO produz perturbações cada vez MAIORES conforme
+        # o modelo cresce. Medimos exatamente isso — com ρ=0,03:
+        #
+        #        modelo de  3M  ->  ‖ε‖_F = 1,68   (o ótimo calibrado)
+        #        modelo de 31M  ->  ‖ε‖_F = 3,76   (super-dose: perdeu)
+        #
+        # e já tínhamos medido que ‖ε‖_F ≈ 3 DESTRÓI o modelo (ganho −0,087).
+        #
+        # A correção: o usuário fixa a NORMA ALVO e o ρ por matriz é derivado
+        # dela. Assim a dose fica constante entre arquiteturas, que é o que o
+        # benchmark exige (um único conjunto de hiperparâmetros p/ MLP, CNN e
+        # Transformer).
+        #
+        # POR QUE NÃO uma fração de ‖W‖_F (estilo ASAM): parece natural, mas vai
+        # na direção ERRADA aqui. ‖W‖_F cresce ~3,2× de 3M para 31M, o que daria
+        # ‖ε‖_F ≈ 5,1 — ainda mais alto que os 3,76 que já falharam.
+        #
+        # ⚠ O valor 1,68 foi calibrado num transformer de 3M (grade fina, 20
+        # sementes pareadas). A regra ρ ∝ 1/√S é DERIVADA da geometria e explica
+        # a falha observada em 31M, mas ainda não foi validada diretamente.
+        # ---------------------------------------------------------------------
+        #
+        # TETO DE SEGURANÇA. A dose de 1,68 foi calibrada num transformer de 3M,
+        # onde ela vale ~5% de ‖W‖_F. Num MLP ou CNN pequenos a MESMA dose
+        # absoluta chega a 26–38% de ‖W‖_F — perturbação demais. O teto limita a
+        # dose a uma fração de ‖W‖_F e só entra em ação em modelos pequenos:
+        #
+        #     MLP pequeno   1,68 -> 0,65   (limitado)
+        #     CNN pequena   1,68 -> 0,44   (limitado)
+        #     Transf.  3M   1,68 -> 1,68   (intacto: a calibração é preservada)
+        #     Transf. 31M   1,68 -> 1,68   (intacto)
         # ---------------------------------------------------------------------
         self._muon_params = muon
         self._S = max(sum(min(como_matriz(p).shape) for p in muon), 1)
-        self.rho_rel = rho_rel
-        self.rho_eff = self._calibrar_rho()
+        self.rho_alvo_F = rho_alvo_F
+        self.rho_teto_rel = rho_teto_rel
+        self.rho_eff = self._calcular_rho()
 
         # estado do controlador de fases
         self.fase = 1
@@ -170,9 +197,11 @@ class MuonSR(Optimizer):
         self._eps: Dict[torch.Tensor, torch.Tensor] = {}
 
     @torch.no_grad()
-    def _calibrar_rho(self) -> float:
+    def _calcular_rho(self) -> float:
+        """ρ por matriz que entrega a dose alvo, respeitando o teto de segurança."""
         wF = math.sqrt(sum(float(p.detach().float().pow(2).sum()) for p in self._muon_params))
-        return (self.rho_rel * wF) / (NS_EFF * math.sqrt(self._S))
+        alvo = min(self.rho_alvo_F, self.rho_teto_rel * wF)
+        return alvo / (NS_EFF * math.sqrt(self._S))
 
     # ==========================================================================
     #  Passo
@@ -196,9 +225,15 @@ class MuonSR(Optimizer):
             self._restaurar()
 
         for g in self.param_groups:
-            lr = g['lr'] * (self.fase2_lr_frac if self.fase == 2 else 1.0)
-            # LR menor na fase 2: ela parte de um modelo já convergido, e um LR
-            # alto o chutaria para fora do mínimo.
+            # LR menor a partir da fase 2: ela parte de um modelo já convergido,
+            # e um LR alto o chutaria para fora do mínimo.
+            #
+            # CUIDADO (bug corrigido): o LR reduzido vale para a fase 2 E para a
+            # fase 3. Se voltasse ao valor cheio quando o refinamento termina,
+            # um usuário que continuasse o laço daria um salto de 10× no LR
+            # sobre um modelo refinado — que é exatamente o retreino
+            # descontrolado que sabemos que destrói o modelo.
+            lr = g['lr'] * (self.fase2_lr_frac if self.fase >= 2 else 1.0)
             (self._passo_muon if g['tipo'] == 'muon' else self._passo_adamw)(g, lr)
 
         self.passos += 1
@@ -343,9 +378,21 @@ class MuonSR(Optimizer):
         """
         if self._best is not None:
             self.model.load_state_dict(self._best)
-        # No modo relativo a dose depende de ‖W‖_F, e os pesos cresceram durante
-        # a fase 1 — recalcular aqui usa o modelo que será de fato perturbado.
-        self.rho_eff = self._calibrar_rho()
+
+        # Zera o momentum do Muon. Os pesos acabaram de ser REBOBINADOS para o
+        # best, mas o buffer de momentum foi acumulado nos pesos posteriores —
+        # ele apontaria numa direção calculada em outro ponto do espaço. Como a
+        # fase 2 tem uma rampa de ~200 passos, o momentum se reconstrói bem
+        # antes de a perturbação chegar ao valor cheio.
+        # (Os momentos do AdamW são estimativas de ESCALA, não de direção, e se
+        #  readaptam sozinhos — zerá-los causaria um transiente de bias-correction.)
+        for g in self.param_groups:
+            if g['tipo'] == 'muon':
+                for p in g['params']:
+                    if 'buf' in self.state[p]:
+                        self.state[p]['buf'].zero_()
+
+        self.rho_eff = self._calcular_rho()   # os pesos cresceram na fase 1
         self.fase = 2
         self.passos_f2 = 0
         self._sem_melhora = 0
@@ -358,7 +405,7 @@ class MuonSR(Optimizer):
 
     def resumo(self) -> str:
         return (f"Muon-SR | {len(self._muon_params)} matrizes via Muon | S={self._S} | "
-                f"ρ_eff={self.rho_eff:.4f} | fase={self.fase} | "
+                f"ρ_eff={self.rho_eff:.4f} (‖ε‖F alvo={self.rho_alvo_F}) | fase={self.fase} | "
                 f"passos={self.passos} (f1={self.passos_f1}, f2={self.passos_f2}) | "
                 f"best={self.best_val:.5f} na fase {self.best_fase}")
 
@@ -415,13 +462,60 @@ def auditorias():
     dif = max((p.detach() - q).abs().max().item() for p, q in zip(net.parameters(), w0))
     chk("A6 a perturbação restaura W exatamente (lr=0 -> W inalterado)", dif < 1e-6, f"maxdiff={dif:.1e}")
 
-    a = MuonSR(nn.Sequential(nn.Linear(20, 64), nn.ReLU(), nn.Linear(64, 1)), lr=1e-3)
-    b = MuonSR(nn.Sequential(nn.Linear(20, 1024), nn.ReLU(), nn.Linear(1024, 1)), lr=1e-3)
-    def razao(o):
+    # A7 — a dose ‖ε‖_F é constante entre arquiteturas (ρ se ajusta sozinho)
+    peq = MuonSR(nn.Sequential(*[nn.Linear(256, 256, bias=False) for _ in range(16)]), lr=1e-3)
+    gra = MuonSR(nn.Sequential(*[nn.Linear(512, 512, bias=False) for _ in range(40)]), lr=1e-3)
+    def dose(o):
+        return o.rho_eff * NS_EFF * math.sqrt(o._S)
+    chk("A7 a dose ‖ε‖_F é a MESMA nos dois modelos (é ela o hiperparâmetro)",
+        abs(dose(peq) - dose(gra)) < 1e-4, f"{dose(peq):.3f} vs {dose(gra):.3f}")
+
+    # A8 — e para isso o ρ por matriz DIMINUI conforme o modelo cresce
+    chk("A8 ρ_eff cai com o tamanho do modelo (a correção que o teste de 31M exigiu)",
+        gra.rho_eff < peq.rho_eff and 2.0 < peq.rho_eff / gra.rho_eff < 2.5,
+        f"ρ_eff {peq.rho_eff:.5f} (16×256) -> {gra.rho_eff:.5f} (40×512), razão {peq.rho_eff/gra.rho_eff:.2f}×")
+
+    # A9 — e reproduz exatamente o ρ medido na arquitetura calibrada
+    chk("A9 ρ_eff = 0,030 na arquitetura onde foi calibrado (16 matrizes 256×256)",
+        abs(peq.rho_eff - 0.030) < 0.004, f"ρ_eff={peq.rho_eff:.5f} vs 0,030 medido")
+
+    # A10 — o teto de segurança age só onde precisa
+    def dose_e_razao(o):
         wF = math.sqrt(sum(float(p.detach().float().pow(2).sum()) for p in o._muon_params))
-        return o.rho_eff * NS_EFF * math.sqrt(o._S) / wF
-    chk("A7 a dose ‖ε‖/‖W‖ é a mesma em modelos de tamanhos diferentes (transfere)",
-        abs(razao(a) - razao(b)) < 1e-4, f"{razao(a):.4f} vs {razao(b):.4f} (modelo 16× maior)")
+        return o.rho_eff * NS_EFF * math.sqrt(o._S), wF
+    mlp = MuonSR(nn.Sequential(nn.Linear(20, 64), nn.ReLU(), nn.Linear(64, 1)), lr=1e-3)
+    d_mlp, w_mlp = dose_e_razao(mlp)
+    d_trf, w_trf = dose_e_razao(peq)
+    chk("A10 teto limita a dose em modelo pequeno (‖ε‖/‖W‖ <= 10%)",
+        d_mlp / w_mlp <= 0.1 + 1e-6 and d_mlp < 1.68,
+        f"MLP: dose {d_mlp:.2f} = {100*d_mlp/w_mlp:.0f}% de ‖W‖F (sem teto seria 1,68)")
+    chk("A10b e NÃO toca no transformer onde a dose foi calibrada",
+        abs(d_trf - 1.68) < 1e-6, f"transformer: dose {d_trf:.2f} = {100*d_trf/w_trf:.0f}% de ‖W‖F")
+
+    # A11 — o LR reduzido NÃO volta ao valor cheio quando a fase 2 termina
+    ol = MuonSR(nn.Linear(4, 4), lr=1.0, fase2_lr_frac=0.1)
+    lrs = {}
+    for f in (1, 2, 3):
+        ol.fase = f
+        lrs[f] = ol.param_groups[0]['lr'] * (ol.fase2_lr_frac if ol.fase >= 2 else 1.0)
+    chk("A11 LR não salta de volta ao terminar a fase 2 (fase 3 mantém o reduzido)",
+        lrs[1] == 1.0 and lrs[2] == 0.1 and lrs[3] == 0.1, f"fase1={lrs[1]} fase2={lrs[2]} fase3={lrs[3]}")
+
+    # A12 — o momentum é zerado ao rebobinar (senão apontaria para outro ponto)
+    torch.manual_seed(3)
+    mm = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 1))
+    om = MuonSR(mm, lr=1e-2)
+    Xm, Ym = torch.randn(32, 8), torch.randn(32, 1)
+    for _ in range(10):
+        om.zero_grad(); ((mm(Xm) - Ym) ** 2).mean().backward(); om.step()
+    om.observe_val(1.0)                                  # cria um best
+    nao_zero = any(self_p['buf'].abs().max() > 0 for self_p in
+                   [om.state[p] for p in om.param_groups[0]['params'] if 'buf' in om.state[p]])
+    om._iniciar_fase2()
+    zerado = all(om.state[p]['buf'].abs().max() == 0 for p in om.param_groups[0]['params']
+                 if 'buf' in om.state[p])
+    chk("A12 momentum zerado ao rebobinar para o best (estava não-nulo antes)",
+        nao_zero and zerado, "buffer != 0 antes, == 0 depois")
 
     print("=" * 72); print("RESULTADO:", "TODAS PASSARAM" if ok else "HOUVE FALHAS"); print("=" * 72)
     return ok

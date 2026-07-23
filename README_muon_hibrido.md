@@ -120,7 +120,8 @@ Na maioria dos casos você só mexe no `lr`.
 | `lr` | `3e-3` | taxa de aprendizado da fase 1 |
 | `momentum` | `0.95` | momentum do Muon |
 | `weight_decay` | `0.01` | decaimento de peso |
-| `rho_rel` | `0.20` | tamanho da perturbação, como fração de ‖W‖ |
+| `rho_alvo_F` | `1.68` | tamanho da perturbação (norma alvo), calibrado |
+| `rho_teto_rel` | `0.10` | teto: a perturbação nunca passa de 10% de ‖W‖ |
 | `fase2_lr_frac` | `0.1` | LR da fase 2 = `lr × isto` |
 | `fase2_patience` | `3` | avaliações sem melhora até encerrar a fase 2 |
 | `fase2_teto_frac` | `0.25` | teto da fase 2 = 25% dos passos da fase 1 |
@@ -128,7 +129,39 @@ Na maioria dos casos você só mexe no `lr`.
 
 **Se a fase 2 nunca disparar:** aumente `gatilho_frac` (ex.: `0.3`) ou avalie com mais frequência — o gatilho precisa de pelo menos 4 medições de validação.
 
-**Se a fase 2 piorar o resultado:** reduza `rho_rel` para `0.1`. Nada se perde de qualquer forma, porque `best_state()` devolve o melhor ponto observado.
+**Se a fase 2 piorar o resultado:** reduza `rho_alvo_F` (ex.: `0.8`) ou `rho_teto_rel` (ex.: `0.05`). Nada se perde de qualquer forma, porque `best_state()` devolve o melhor ponto observado.
+
+---
+
+## Como a perturbação é dimensionada
+
+Você não escolhe o `ρ` diretamente — escolhe a **norma da perturbação**, e o `ρ` por matriz é derivado dela:
+
+```
+‖ε‖_F = ρ · √S · 0,875        S = Σ min(m, n) sobre as matrizes do Muon
+```
+
+Isso importa porque **um `ρ` fixo perturba cada vez mais conforme o modelo cresce**. Medimos: com `ρ = 0,03`, um modelo de 3M recebe `‖ε‖ = 1,68` (o ótimo) e um de 31M recebe `3,76` — e já sabíamos que `‖ε‖ ≈ 3` destrói o modelo. Fixando a norma, o `ρ` se ajusta sozinho:
+
+| modelo | ρ automático | dose |
+|---|---|---|
+| 16 matrizes 256×256 (3M) | 0,0300 | 1,68 |
+| 40 matrizes 512×512 (31M) | 0,0134 | 1,68 |
+
+E há um **teto de segurança**: a dose nunca passa de 10% de ‖W‖. Ele só age em modelos pequenos, onde `1,68` seria uma fração alta dos pesos:
+
+| modelo | dose sem teto | dose com teto |
+|---|---|---|
+| MLP pequeno | 1,68 (26% de ‖W‖) | **0,47** (10%) |
+| CNN pequena | 1,68 (38% de ‖W‖) | **0,44** (10%) |
+| Transformer 3M | 1,68 (5% de ‖W‖) | 1,68 (intacto) |
+
+Confira o que o seu modelo recebeu:
+
+```python
+print(opt.resumo())
+# Muon-SR | 16 matrizes via Muon | S=4096 | ρ_eff=0.0300 (‖ε‖F alvo=1.68) | ...
+```
 
 ---
 
@@ -169,10 +202,31 @@ Você não está chamando `observe_val`, ou está avaliando poucas vezes (precis
 **O `closure` não pode esquecer o `zero_grad()`**
 Sem ele, os gradientes das duas passadas se somam e o passo sai errado.
 
+**`RuntimeError` no meio de um treino longo**
+Se a fase 2 disparar e você não estiver passando `closure`, o erro aparece só naquele momento — depois de horas de treino. Passe o `closure` desde o início.
+
+---
+
+## Limitações conhecidas
+
+**O estado das fases não entra no `state_dict()`.** Se você salvar e recarregar o otimizador no meio do treino, a fase, o melhor checkpoint e os contadores de passo se perdem — o treino recomeça na fase 1. Para retomar treinos longos, salve também:
+
+```python
+extra = dict(fase=opt.fase, best_val=opt.best_val, passos_f1=opt.passos_f1)
+```
+
+**A perturbação só age nas matrizes do Muon.** Os parâmetros do AdamW (embeddings, saída, normalizações) recebem gradientes calculados no ponto perturbado, mas não são perturbados eles próprios. É intencional — a geometria espectral não faz sentido para eles.
+
+**A dose foi calibrada em um transformer.** Ver a nota no fim deste guia.
+
 ---
 
 ## Uma nota de honestidade
 
-O valor `rho_rel = 0.20` é uma **estimativa derivada**, não medido diretamente. A calibração original (`‖ε‖ = 1.68`) foi feita num transformer pequeno, com 20 sementes pareadas; a conversão para fração de ‖W‖ é uma inferência.
+A dose `‖ε‖ = 1.68` foi **medida** num transformer de 3M, com grade fina e 20 sementes pareadas. Já a regra `ρ ∝ 1/√S` e o teto de 10% são **derivados** — explicam uma falha que observamos num modelo de 31M, mas não foram validados diretamente.
 
-Se tiver tempo, vale varrer `rho_rel ∈ {0.1, 0.2, 0.4}` numa das suas arquiteturas antes de rodar o benchmark. É o único número do desenho que ainda não foi medido no lugar onde vai ser usado.
+Num teste em 31M com `ρ` transferido sem a correção, a perturbação espectral **perdeu** para a euclidiana (−0,0097, 4 sementes, intervalo ainda cruzando o zero). A explicação mais provável é super-dose: aquele `ρ` entregava `‖ε‖ = 3,76`. É essa falha que a fórmula corrige.
+
+O que sabemos com segurança é que **a fase 2 rende ~+0,11 nas duas escalas** — o refinamento em si transfere bem. Qual geometria é melhor é que depende da escala, e vale ~5%.
+
+Se tiver tempo antes do benchmark, varra `rho_alvo_F ∈ {0.8, 1.68, 3.0}` numa das suas arquiteturas. É o número que mais vale confirmar no lugar onde vai ser usado.
